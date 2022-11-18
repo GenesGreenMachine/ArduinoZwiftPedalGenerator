@@ -14,7 +14,7 @@
 #include <ArduinoBLE.h>
 #include <ModbusMaster.h>
 
-boolean debugging = false;   // set this to true to get serial debug output
+bool debugging = false;   // set this to true to get serial debug output
 
 // The Fitness Machine Control Point data type structure 
 #define FMCP_DATA_SIZE 19 // Control point consists of 1 opcode (byte) and maximum 18 bytes as parameters
@@ -96,7 +96,9 @@ BLEDevice central;
 // *** change these variables to match your fitness/environment ***
 
 float ftpWatts = 140;       // base FTP to use for sim calculations  
-float losses = 1.12;         // losses multiplier, account for losses in drive train, rectifier, charge controller, etc
+// losses multiplier, account for losses in drive train, rectifier, charge controller, etc - 1.12 = 12% losses
+// My setup is approximately 2% from drivetrain, 4% from bridge rectifier, 6% from charge controller
+float losses = 1.12;         
 
 // Data for the resistance calculation in sim mode
 
@@ -119,11 +121,13 @@ unsigned int setWatts = 50;
 unsigned long WRITEDELAY = 750;  // 750 seems to work with Nano IoT 33 and DPS5020, YMMV
 unsigned long lastWrite = 0;
 unsigned long startTime;
+bool simMode = false; 
 
 // hall effect RPM variables
 const byte hallInterruptPin = 2;      // the data pin for the hall effect sensor, hook + and - to the other two pins
 const byte simCadenceMultiplier = 5;  // change this to adjust how much resistance changes when varying cadence up or down from 80.  4 or 5 works pretty good
 volatile float RPM = 80.0;
+volatile unsigned int tachCount=0;
 volatile unsigned long rpmEndTime=0;
 volatile unsigned long rpmStartTime=0;
 volatile unsigned long timePassed=0;
@@ -219,6 +223,7 @@ void loop() {
                 Serial.println("Start the training");
               }
               startTime = millis();
+              simMode = false;
               node.writeSingleRegister(9, 1); //set DPS power on !
               ftmsControlPointBuf[2] =  0x01; // OpCode supported 
               break;
@@ -233,6 +238,7 @@ void loop() {
               if (debugging) {
                 Serial.println("Indoor bike simulation parameters request");
               }
+              simMode = true;
               int16_t ws = (int16_t)((fmcpData.values.OCTETS[1] << 8) + fmcpData.values.OCTETS[0]); // Short is 16 bit signed, so the windspeed is converted from two bytes to signed value. Highest bit is sign bit
               wind_speed = ws / 1000.0;
               int16_t gr = (int16_t)((fmcpData.values.OCTETS[3] << 8) + fmcpData.values.OCTETS[2]); // Short is 16 bit signed, so a negative grade is correctly converted from two bytes to signed value. Highest bit is sign bit
@@ -249,7 +255,7 @@ void loop() {
               setWatts = setTrainerResistance(wind_speed, grade, crr, cw);
               Amps = (float)((setWatts/losses)/Volts);
                 if ((millis() - lastWrite) <= WRITEDELAY) {
-                delay(millis() - lastWrite); 
+                delay(WRITEDELAY - (millis() - lastWrite));  
               }                
               node.writeSingleRegister(1, round(Amps*100)); // 500 = 5 amps  
               lastWrite = millis();
@@ -277,7 +283,7 @@ void loop() {
               }
               short resistance = (fmcpData.values.OCTETS[1] << 8) + fmcpData.values.OCTETS[0];
               if ((millis() - lastWrite) <= WRITEDELAY) {
-                delay(millis() - lastWrite); 
+                delay(WRITEDELAY - (millis() - lastWrite));  
               }              
               node.writeSingleRegister(1, round(resistance)); // 500 = 5 amps  
               lastWrite = millis();    
@@ -293,7 +299,7 @@ void loop() {
 
               // writing too frequently fails, adding a delay
               if ((millis() - lastWrite) <= WRITEDELAY) {
-                delay(millis() - lastWrite); 
+                delay(WRITEDELAY - (millis() - lastWrite)); 
               }  
               node.writeSingleRegister(1, round(Amps*100)); // 500 = 5 amps  
               lastWrite = millis();
@@ -347,13 +353,18 @@ void loop() {
             Serial.println("Indoor Bike Data written");
           }
 
+          // if SIM mode is being used, update the resistance frequently 
+          if (simMode) {
+              setWatts = setTrainerResistance(wind_speed, grade, crr, cw);
+          }
+
           // if the watts are off from what was set previously, adjust to match
           if (setWatts != instantaneous_power) {
 
             Amps = (float)((setWatts/losses)/Volts);
 
             if ((millis() - lastWrite) <= WRITEDELAY) {
-              delay(millis() - lastWrite); 
+              delay(WRITEDELAY - (millis() - lastWrite));  
             }
             node.writeSingleRegister(1, round(Amps*100)); // 500 = 5 amps  
             lastWrite = millis();
@@ -388,8 +399,13 @@ int setTrainerResistance(float wind_speed, float grade, float crr, float cw) {
 }
 
 void calcRPM() {
-  rpmEndTime = millis();
-  timePassed = (rpmEndTime-rpmStartTime);
-  RPM = (60000/timePassed);
-  rpmStartTime = rpmEndTime;
+  tachCount++;
+  if (tachCount==2)
+  {
+    rpmEndTime = millis();
+    timePassed = (rpmEndTime-rpmStartTime);
+    RPM = ((60000/timePassed)*2);
+    rpmStartTime = rpmEndTime;
+    tachCount=0;
+  }
 }
