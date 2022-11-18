@@ -15,7 +15,7 @@
 #include <ArduinoBLE.h>
 #include <ModbusMaster.h>
 
-boolean debugging = false; 
+bool debugging = false; 
 
 // The Fitness Machine Control Point data type structure 
 
