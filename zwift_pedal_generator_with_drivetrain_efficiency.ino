@@ -32,10 +32,10 @@
  */
 
 // Functional Threshold Power in watts — scales ERG and free-ride current
-const int   USER_FTP_WATTS        = 150;
+const int   USER_FTP_WATTS        = 160;
 
 // Typical cadence at FTP, used for Free Ride resistance calculation
-const float FTP_CADENCE_RPM = 90.0f;
+const float FTP_CADENCE_RPM = 80.0f;
 
 // Maximum current the DPS will ever be commanded to (amps × 100 for Modbus)
 // Keep below your generator's stall current and DPS rated output.
@@ -46,14 +46,14 @@ const float DPS_MAX_CURRENT_AMPS  = 20.0f;
 const float DPS_NOMINAL_VOLTAGE   = 14.6f;
 
 // Minimum load current held even at zero cadence (keeps DPS output live)
-const float DPS_MIN_CURRENT_AMPS  = 0.05f;
+const float DPS_MIN_CURRENT_AMPS  = 2.0f;
 
 // Combined drivetrain + rectifier + controller efficiency (0.0–1.0).
 // The DPS measures electrical power AFTER losses; dividing by this factor
 // back-calculates the mechanical power the rider actually produced at the
 // pedals, which is what gets reported to Zwift.
-// Example: 0.70 means 30% losses → pedal power = DPS_watts / 0.70
-const float DRIVETRAIN_EFFICIENCY = 0.70f;
+// Example: 0.68 means 32% losses → pedal power = DPS_watts / 0.68
+const float DRIVETRAIN_EFFICIENCY = 0.68f;
 
 // Modbus slave address set on the DPS unit (default from factory = 1)
 const uint8_t DPS_MODBUS_ADDRESS  = 1;
@@ -73,9 +73,9 @@ const int MAGNETS_PER_REVOLUTION  = 1;
 //  0x0002  U-OUT    Output voltage    (× 100)                         RD
 //  0x0003  I-OUT    Output current    (× 100)                         RD
 //  0x0006  P-OUT    Output power      (× 100, watts)                  RD
-//  0x0005  U-IN     Input voltage     (× 100)                         RD
-//  0x0009  LOCK     Key lock          0=unlocked 1=locked             WR
-//  0x000B  ON-OFF   Output enable     0=off 1=on                      WR
+//  0x0005  V-IN     Input voltage     (× 100)                         RD
+//  0x0008  LOCK     Key lock          0=unlocked 1=locked             WR
+//  0x0009  ON-OFF   Output enable     0=off 1=on                      WR
 // ============================================================
 
 #define DPS_REG_V_SET   0x0000
@@ -83,9 +83,9 @@ const int MAGNETS_PER_REVOLUTION  = 1;
 #define DPS_REG_V_OUT   0x0002
 #define DPS_REG_I_OUT   0x0003
 #define DPS_REG_P_OUT   0x0006
-#define DPS_REG_V_IN    0x0004
+#define DPS_REG_V_IN    0x0005
 #define DPS_REG_LOCK    0x0008
-#define DPS_REG_ON_OFF  0x000B
+#define DPS_REG_ON_OFF  0x0009
 
 // ============================================================
 
@@ -134,7 +134,7 @@ uint16_t crankRevolutions = 0;
 
 unsigned long lastNotifyMs  = 0;
 unsigned long lastModbusMs  = 0;
-const unsigned long NOTIFY_INTERVAL_MS = 1000;   // BLE @ 1 Hz
+const unsigned long NOTIFY_INTERVAL_MS = 1000;   // BLE 1.0 Hz
 const unsigned long MODBUS_INTERVAL_MS = 750;    // DPS poll @ 4 Hz  - GEN changed from 250 to 750
 
 
@@ -204,7 +204,7 @@ void setup() {
     // Feature flags: cadence (bit3) + power (bit7) supported
     // Target setting: power target (bit3) + resistance target (bit7)
     static uint8_t ftmFeatureVal[8] = {0x88, 0x00, 0x00, 0x00,
-                                        0x04, 0x00, 0x00, 0x00};  // GEN changed first byte from 0x88 to 0x04 to just use target
+                                        0x88, 0x00, 0x00, 0x00};  
     ftmFeature.writeValue(ftmFeatureVal, 8);
     ftmsService.addCharacteristic(ftmFeature);
     ftmsService.addCharacteristic(bikeData);
@@ -245,7 +245,7 @@ void loop() {
                 applyLoadToDPS();
             }
 
-            // BLE notifications at 1 Hz
+            // BLE notifications 
             if (now - lastNotifyMs >= NOTIFY_INTERVAL_MS) {
                 lastNotifyMs = now;
                 sendCPMeasurement();
@@ -354,10 +354,9 @@ void applyLoadToDPS() {
         // Power scales as (cadence / ftpCadence)^3 for a generator — adjust
         // the exponent to taste; linear (^1) is simpler and more intuitive.
         float fraction = currentCadenceRPM / FTP_CADENCE_RPM;
-        if (fraction > 1.0f) fraction = 1.0f;
         if (fraction < 0.0f) fraction = 0.0f;
-        // targetAmps = fraction * DPS_MAX_CURRENT_AMPS;  // this isn't right, need to incorporate FTP and efficiency
-        targetAmps = fraction * ((USER_FTP_WATTS/currentVoltage)*DRIVETRAIN_EFFICIENCY);
+
+        targetAmps = pow( (USER_FTP_WATTS/currentVoltage) , fraction) * DRIVETRAIN_EFFICIENCY;
 
         Serial.print("[Free Ride Mode] fraction = ");
         Serial.print(fraction);
@@ -382,6 +381,7 @@ void applyLoadToDPS() {
 // DPS expects value × 100 (e.g. 3.50 A → 350)
 // ---------------------------------------------------------------------------
 void setDPSCurrentAmps(float amps) {
+
     uint16_t regVal = (uint16_t)(amps * 100.0f + 0.5f);
     Serial.print("Setting Current Amps to: ");
     Serial.println(amps);
@@ -392,6 +392,7 @@ void setDPSCurrentAmps(float amps) {
         Serial.print("DPS I-SET write error: 0x");
         Serial.println(result, HEX);
     }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +519,7 @@ void onFTMControlPoint(BLEDevice device, BLECharacteristic characteristic) {
     switch (opCode) {
         case 0x00:  // Request Control
             Serial.println("FTMS: Control granted to Zwift");
+            setDPSOutput(true);
             break;
 
         case 0x01:  // Reset — return to free-ride, minimum load
@@ -527,7 +529,7 @@ void onFTMControlPoint(BLEDevice device, BLECharacteristic characteristic) {
             Serial.println("FTMS: Reset — free-ride mode");
             break;
 
-        case 0x05:  // Set Target Resistance (0–100 %)
+        case 0x04:  // Set Target Resistance (0–100 %)
             if (len >= 2) {
                 targetResistPct  = data[1];
                 targetPowerWatts = -1;
@@ -537,14 +539,38 @@ void onFTMControlPoint(BLEDevice device, BLECharacteristic characteristic) {
             } else {
                 response[2] = 0x02;
             }
-            break;
-
-        case 0x11:  // Set Target Power (ERG)
+            break;        
+            
+        case 0x05:  // Set Target Power
             if (len >= 3) {
                 int16_t watts    = (int16_t)(data[1] | (data[2] << 8));
                 targetPowerWatts = (watts < 0) ? 0 : watts;
                 targetResistPct  = 0;
-                Serial.print("FTMS: ERG target = ");
+                Serial.print("FTMS: Power target = ");
+                Serial.print(targetPowerWatts);
+                Serial.println(" W");
+            } else {
+                response[2] = 0x02;
+            }
+            break;
+
+        case 0x07:  // Resume or Start the training
+            Serial.println("FTMS: Resume or Start the training");
+            break;
+
+        case 0x08:  // Stop or pause training — return to free-ride, minimum load
+            targetPowerWatts = -1;
+            targetResistPct  = 0;
+            setDPSCurrentAmps(DPS_MIN_CURRENT_AMPS);
+            Serial.println("FTMS: Reset — free-ride mode");
+            break;
+
+        case 0x11:  // Set Target Power (ERG) Sim mode
+            if (len >= 3) {
+                int16_t watts    = (int16_t)(data[1] | (data[2] << 8));
+                targetPowerWatts = (watts < 0) ? 0 : watts;
+                targetResistPct  = 0;
+                Serial.print("FTMS: Bike Sim ERG target = ");
                 Serial.print(targetPowerWatts);
                 Serial.println(" W");
             } else {
