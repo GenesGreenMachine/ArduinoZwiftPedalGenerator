@@ -34,8 +34,14 @@
 // Functional Threshold Power in watts — scales ERG and free-ride current
 const int   USER_FTP_WATTS        = 160;
 
-// Typical cadence at FTP, used for Free Ride resistance calculation
-const float FTP_CADENCE_RPM = 80.0f;
+// Pedal power floor — reported to Zwift even at very low cadence (watts)
+const float FREE_RIDE_MIN_WATTS   = 50.0f;
+
+// Cadence at which the rider should feel their full FTP wattage
+const float FTP_CADENCE_RPM       = 85.0f;
+
+// Cadence at which DPS_MAX_CURRENT_AMPS is commanded (full sprint load)
+const float MAX_CADENCE_RPM       = 105.0f;
 
 // Maximum current the DPS will ever be commanded to (amps × 100 for Modbus)
 // Keep below your generator's stall current and DPS rated output.
@@ -134,7 +140,7 @@ uint16_t crankRevolutions = 0;
 
 unsigned long lastNotifyMs  = 0;
 unsigned long lastModbusMs  = 0;
-const unsigned long NOTIFY_INTERVAL_MS = 1000;   // BLE 1.0 Hz
+const unsigned long NOTIFY_INTERVAL_MS = 500;   // BLE 2.0 Hz - GEN changed to 500 from 1.0/1000
 const unsigned long MODBUS_INTERVAL_MS = 750;    // DPS poll @ 4 Hz  - GEN changed from 250 to 750
 
 
@@ -349,18 +355,54 @@ void applyLoadToDPS() {
         Serial.println("A");
 
     } else {
-        // --- Free-ride: cadence-proportional load ---
-        // Estimate a cadence that equals FTP (typically ~90 RPM at FTP).
-        // Power scales as (cadence / ftpCadence)^3 for a generator — adjust
-        // the exponent to taste; linear (^1) is simpler and more intuitive.
-        float fraction = currentCadenceRPM / FTP_CADENCE_RPM;
-        if (fraction < 0.0f) fraction = 0.0f;
+        // --- Free-ride: two-segment piecewise linear power curve ---
+        //
+        // Segment 1 (0 → FTP_CADENCE_RPM):
+        //   pedal watts interpolate from FREE_RIDE_MIN_WATTS → USER_FTP_WATTS
+        //
+        // Segment 2 (FTP_CADENCE_RPM → MAX_CADENCE_RPM):
+        //   pedal watts interpolate from USER_FTP_WATTS → max electrical load
+        //   (DPS_MAX_CURRENT_AMPS × voltage / efficiency)
+        //
+        // Both segments are converted to a DPS current command via:
+        //   electrical_watts = pedal_watts × DRIVETRAIN_EFFICIENCY
+        //   amps = electrical_watts / voltage
 
-        targetAmps = pow( (USER_FTP_WATTS/currentVoltage) , fraction) * DRIVETRAIN_EFFICIENCY;
+        float vRef = (currentVoltage > 1.0f) ? currentVoltage
+                                              : DPS_NOMINAL_VOLTAGE;
 
-        Serial.print("[Free Ride Mode] fraction = ");
-        Serial.print(fraction);
-        Serial.print(" FTP=");
+        // Maximum pedal watts the DPS can absorb at full current
+        float maxPedalWatts = (DPS_MAX_CURRENT_AMPS * vRef) / DRIVETRAIN_EFFICIENCY;
+
+        float pedalWatts;
+
+        if (currentCadenceRPM <= 0.0f) {
+            pedalWatts = FREE_RIDE_MIN_WATTS;
+
+        } else if (currentCadenceRPM <= FTP_CADENCE_RPM) {
+            // Segment 1 — linear from min watts up to FTP watts
+            float t    = currentCadenceRPM / FTP_CADENCE_RPM;  // 0.0 → 1.0
+            pedalWatts = FREE_RIDE_MIN_WATTS +
+                         t * ((float)USER_FTP_WATTS - FREE_RIDE_MIN_WATTS);
+
+        } else if (currentCadenceRPM < MAX_CADENCE_RPM) {
+            // Segment 2 — linear from FTP watts up to max watts
+            float t    = (currentCadenceRPM - FTP_CADENCE_RPM) /
+                         (MAX_CADENCE_RPM   - FTP_CADENCE_RPM); // 0.0 → 1.0
+            pedalWatts = (float)USER_FTP_WATTS +
+                         t * (maxPedalWatts - (float)USER_FTP_WATTS);
+
+        } else {
+            // At or above max cadence — full DPS load
+            pedalWatts = maxPedalWatts;
+        }
+
+        float electricalWatts = pedalWatts * DRIVETRAIN_EFFICIENCY;
+        targetAmps = electricalWatts / vRef;
+
+        Serial.print("[Free Ride Mode] pedalWatts = ");
+        Serial.print(pedalWatts);
+        Serial.print("W FTP=");
         Serial.print(USER_FTP_WATTS, 1);
         Serial.print("W  cadence=");
         Serial.print(currentCadenceRPM, 1);
